@@ -25,6 +25,8 @@ const REG = path.join(DIR, 'registry.json')
 // difference is the whole point: a pusher that claims and then dies must not make
 // the message look handled, or the next pass skips it and nobody ever sees it.
 const DEL = path.join(DIR, 'deliveries.json')
+// Attempts must not restart at 1 after release or an expired lease.
+const ATT = path.join(DIR, 'delivery-attempts.json')
 // Idempotency index for /send: clientMsgId -> { seq, hash, at }. A retried send
 // returns the original message instead of appending a duplicate.
 const SENT = path.join(DIR, 'sent.json')
@@ -266,6 +268,7 @@ function normDelivery(rec) {
     leaseUntil: Number(rec.leaseUntil) || 0,
     attempts: Number(rec.attempts) || 0,
     instance: typeof rec.instance === 'string' ? rec.instance : '',
+    turn: rec.turn && ['running', 'completed', 'failed'].includes(rec.turn.state) ? rec.turn : null,
   }
 }
 
@@ -289,6 +292,7 @@ function deliveryView(seqNo) {
   const now = Date.now()
   return {
     target: d.target, peer: d.peer, state: d.state, attempts: d.attempts,
+    instance: d.instance, turn: d.turn,
     expiresIn: d.state === 'claimed' ? Math.max(0, Math.round((d.leaseUntil - now) / 1000)) : 0,
   }
 }
@@ -826,7 +830,11 @@ const server = http.createServer(async (req, res) => {
             : 'claim renewal requires instance=',
         })
       }
-      const attempts = prev ? prev.attempts + 1 : 1
+      const attemptHistory = readJson(ATT, {})
+      const attempts = Math.max(prev ? prev.attempts : 0, Number(attemptHistory[rec.seq]) || 0) + 1
+      attemptHistory[rec.seq] = attempts
+      fs.writeFileSync(ATT + '.tmp', JSON.stringify(attemptHistory))
+      fs.renameSync(ATT + '.tmp', ATT)
       deliveries[String(rec.seq)] = {
         target: wanted, peer, ts: new Date().toISOString(), at: now,
         state: 'claimed', leaseUntil: now + ttl,
@@ -865,10 +873,40 @@ const server = http.createServer(async (req, res) => {
       deliveries[key] = {
         target, peer: prev.peer, ts: new Date().toISOString(), at: Date.now(),
         state: 'delivered', leaseUntil: 0, attempts: prev.attempts,
+        turn: prev.turn,
         ...(prev.instance ? { instance: prev.instance } : {}),
       }
       writeDeliveries(deliveries)
       return json(res, 200, { ok: true, seq: Number(b.seq), target, state: 'delivered' })
+    }
+    if (url.pathname === '/turn' && req.method === 'POST') {
+      const b = await body(req)
+      if (!b.peer || !Number.isInteger(b.seq) || b.seq <= 0 ||
+          !['running', 'completed', 'failed'].includes(b.state) ||
+          typeof b.instance !== 'string' || !b.instance ||
+          !Number.isInteger(b.attempt) || b.attempt <= 0) {
+        return json(res, 400, { ok: false, error: 'peer, seq, instance, positive attempt and valid turn state required' })
+      }
+      const deliveries = readDeliveries()
+      const prev = normDelivery(deliveries[String(b.seq)])
+      if (!prev || prev.state !== 'delivered' || prev.peer !== b.peer ||
+          prev.instance !== b.instance || prev.attempts !== b.attempt) {
+        return json(res, 409, { ok: false, error: 'turn requires a delivered record with matching peer, instance and attempt' })
+      }
+      if (prev.turn && prev.turn.state !== 'running') {
+        if (prev.turn.state === b.state) return json(res, 200, { ok: true, delivery: deliveryView(b.seq) })
+        return json(res, 409, { ok: false, error: 'terminal turn state cannot be overwritten' })
+      }
+      const at = typeof b.at === 'string' && Number.isFinite(Date.parse(b.at)) ? b.at : new Date().toISOString()
+      const turn = { state: b.state, instance: b.instance, attempt: b.attempt, at }
+      if (Number.isInteger(b.exitCode)) turn.exitCode = b.exitCode
+      if (b.usage && typeof b.usage === 'object' && !Array.isArray(b.usage)) {
+        turn.usage = Object.fromEntries(Object.entries(b.usage).filter(([, v]) => Number.isFinite(v) && v >= 0))
+      }
+      if (typeof b.note === 'string') turn.note = b.note.slice(0, 1000)
+      deliveries[String(b.seq)] = { ...deliveries[String(b.seq)], turn }
+      writeDeliveries(deliveries)
+      return json(res, 200, { ok: true, delivery: deliveryView(b.seq) })
     }
     if (url.pathname === '/delivery') {
       // One message's delivery state. The pusher uses it to drop .todo markers left behind by

@@ -231,8 +231,8 @@ function codexCommand(argv) {
   return { cmd: codexExe(), argv }
 }
 
-const api = async (method, p, payload) => {
-  const init = { method, headers: {} }
+const api = async (method, p, payload, signal) => {
+  const init = { method, headers: {}, ...(signal ? { signal } : {}) }
   if (payload !== undefined) { init.headers['content-type'] = 'application/json'; init.body = JSON.stringify(payload) }
   const res = await fetch(BASE + p, init)
   return res.json()
@@ -296,7 +296,7 @@ async function claim(seqNo, target) {
   }
   if (r && r.state === 'delivered') return { ok: false, already: true }
   if (!r || r.ok === false) return { ok: false, reason: 'claim refused: ' + (r && (r.error || r.hint)) || 'no answer' }
-  return { ok: true }
+  return { ok: true, attempt: r.attempts }
 }
 
 /**
@@ -319,8 +319,36 @@ async function release(seqNo) {
   try { await api('POST', '/release', { peer: PEER, seq: seqNo, instance: INSTANCE }) } catch {}
 }
 
+/** Parse only this worker's stdout; retry errors are not terminal evidence. */
+async function settleExec(seqNo, thread, run, attempt) {
+  const events = []
+  for (const line of (run.stdout || '').split(/\r?\n/)) {
+    try { events.push(JSON.parse(line)) } catch {}
+  }
+  const completed = events.find(e => e && e.type === 'turn.completed')
+  const started = events.some(e => e && e.type === 'turn.started')
+  const received = run.status === 0 || started || !!completed
+  if (!received || !thread) { await release(seqNo); return false }
+  const receipt = await confirm(seqNo, thread)
+  if (!receipt || !receipt.ok) return false
+  const state = run.status === 0 && completed ? 'completed' : 'failed'
+  try {
+    const r = await api('POST', '/turn', {
+      peer: PEER, seq: seqNo, instance: INSTANCE, attempt, state,
+      at: new Date().toISOString(), exitCode: run.status,
+      ...(completed && completed.usage ? { usage: completed.usage } : {}),
+      ...(state === 'failed' ? { note: run.error ? String(run.error.message) :
+        (run.status === 0 ? 'process exited without turn.completed' : 'process exited nonzero') } : {}),
+    }, AbortSignal.timeout(5000))
+    if (!r || !r.ok) console.error('[codex-push] turn write failed for seq ' + seqNo + ': ' + (r && r.error || 'no response'))
+  } catch (err) {
+    console.error('[codex-push] turn write failed for seq ' + seqNo + ': ' + String(err.message || err))
+  }
+  return true // turn persistence never changes a confirmed delivery
+}
+
 /** Deliver into a brand new Codex conversation. Blocking: it runs the turn to completion. */
-function startConversation(message) {
+async function startConversation(message, attempt) {
   const explicit = message?.meta?.thread
   const cwd = (typeof message?.meta?.cwd === 'string' && message.meta.cwd) || EXEC_CWD
   const argv = ['exec', '--skip-git-repo-check', '-s', SANDBOX, '-C', cwd, '--json', promptFor(message)]
@@ -340,7 +368,7 @@ function startConversation(message) {
       if (id) { thread = String(id); if (event.type === 'thread.started') break }
     } catch {}
   }
-  const ok = run.status === 0
+  const ok = await settleExec(message.seq, thread, run, attempt)
   return { ok, thread: thread || '(unknown)', queued: ok, command: line, status: run.status, stderr: (run.stderr || '').slice(0, 400) }
 }
 
@@ -385,7 +413,7 @@ async function pruneTodos() {
  * replaces our placeholder claim with the real thread id; the poll loop keeps running instead
  * of sitting inside a four-minute turn.
  */
-function startConversationAsync(message) {
+function startConversationAsync(message, attempt) {
   fs.mkdirSync(OUTBOX, { recursive: true })
   const promptFile = path.join(OUTBOX, 'seq-' + message.seq + '.prompt')
   fs.writeFileSync(promptFile, promptFor(message, ''), 'utf8')
@@ -397,7 +425,7 @@ function startConversationAsync(message) {
     '--prompt', promptFile,
     '--cwd', (typeof message?.meta?.cwd === 'string' && message.meta.cwd) || EXEC_CWD,
     '--sandbox', SANDBOX, '--port', String(PORT), '--peer', PEER, '--timeout', String(EXEC_TIMEOUT),
-    '--instance', INSTANCE, '--outbox', OUTBOX,
+    '--instance', INSTANCE, '--attempt', String(attempt), '--outbox', OUTBOX,
     // The worker must inherit the test seam; otherwise a stubbed run would launch the real
     // codex.exe in the background (it did once, during testing, and burned a paid turn).
     ...(CODEX_JS ? ['--codex-js', CODEX_JS] : []),
@@ -430,11 +458,10 @@ async function workerMain() {
       if (id) { thread = String(id); if (event.type === 'thread.started') break }
     } catch {}
   }
-  if (run.status === 0 && thread) {
-    await confirm(seqNo, thread)
+  const delivered = await settleExec(seqNo, thread, run, Number(value('attempt', 0)))
+  if (delivered) {
     console.log('[worker] seq ' + seqNo + ' -> ' + thread)
   } else {
-    await api('POST', '/release', { peer: PEER, seq: seqNo, instance: INSTANCE })
     console.log('[worker] seq ' + seqNo + ' failed (status ' + run.status + '): ' + String(run.stderr || '').slice(0, 400))
   }
   try { fs.unlinkSync(todoPath(seqNo)) } catch {}
@@ -448,7 +475,7 @@ async function workerMain() {
  * no live session for the daemon to resume: exit 0, rollout untouched, message stranded. This
  * worker runs one turn itself and confirms the claim only if that turn really started.
  */
-function startResumeAsync(message, thread, text) {
+function startResumeAsync(message, thread, text, attempt) {
   fs.mkdirSync(OUTBOX, { recursive: true })
   const promptFile = path.join(OUTBOX, 'seq-' + message.seq + '.prompt')
   fs.writeFileSync(promptFile, text, 'utf8')
@@ -460,7 +487,7 @@ function startResumeAsync(message, thread, text) {
     '--thread', thread, '--prompt', promptFile,
     '--cwd', (typeof message?.meta?.cwd === 'string' && message.meta.cwd) || EXEC_CWD,
     '--timeout', String(EXEC_TIMEOUT), '--port', String(PORT), '--peer', PEER, '--instance', INSTANCE,
-    '--outbox', OUTBOX,
+    '--outbox', OUTBOX, '--attempt', String(attempt),
     ...(CODEX_JS ? ['--codex-js', CODEX_JS] : []),
   ], { detached: true, stdio: ['ignore', logFd, logFd], windowsHide: true })
   child.unref()
@@ -483,12 +510,10 @@ async function resumeWorkerMain() {
     encoding: 'utf8', windowsHide: true, timeout: Number(value('timeout', EXEC_TIMEOUT)),
     cwd: value('cwd', process.cwd()), input: prompt, stdio: ['pipe', 'pipe', 'pipe'],
   })
-  const ok = run.status === 0
+  const ok = await settleExec(seqNo, thread, run, Number(value('attempt', 0)))
   if (ok) {
-    await confirm(seqNo, thread)
     console.log('[worker] seq ' + seqNo + ' -> ' + thread + ' (resumed)')
   } else {
-    await api('POST', '/release', { peer: PEER, seq: seqNo, instance: INSTANCE })
     console.log('[worker] seq ' + seqNo + ' resume failed (status ' + run.status + '): ' + String(run.stderr || '').slice(0, 400))
   }
   try { fs.unlinkSync(todoPath(seqNo)) } catch {}
@@ -506,12 +531,8 @@ async function deliver(message) {
       // handed to Codex. Stop the pass and let the next one retry.
       return { ok: false, reason: took.reason }
     }
-    if (ASYNC) return startConversationAsync(message)
-    const created = startConversation(message)
-    if (created.queued && created.thread && !created.thread.startsWith('(')) {
-      // Replace our placeholder claim with the real thread id.
-      await confirm(message.seq, created.thread)
-    }
+    if (ASYNC) return startConversationAsync(message, took.attempt)
+    const created = await startConversation(message, took.attempt)
     if (!created.ok) await release(message.seq)
     return created
   }
@@ -531,7 +552,7 @@ async function deliver(message) {
       if (took.already) return { ok: true, skipped: 'already delivered elsewhere', thread }
       return { ok: false, reason: took.reason }
     }
-    return startResumeAsync(message, thread, text)
+    return startResumeAsync(message, thread, text, took.attempt)
   }
   const argv = ['queue', '--thread', thread, '--message', text]
   if (RESUME) argv.push('--resume')

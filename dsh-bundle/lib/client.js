@@ -129,7 +129,11 @@ window.__ModuleLoader__.load({
       // expiresIn is the lease, not a deadline for the work: say so, otherwise 42s reads as
       // "this task must finish in 42 seconds".
       if (d && d.state === "claimed") meta.push("在途 " + (d.peer || "?") + " · 租约剩 " + (d.expiresIn || 0) + "s");
-      else if ((d && d.target) || m.deliveredBy) meta.push("已投 " + ((d && d.target) || m.deliveredBy));
+      else if ((d && d.target) || m.deliveredBy) {
+        meta.push("已投 " + ((d && d.target) || m.deliveredBy));
+        var turnState = d && d.turn && d.turn.state;
+        meta.push(turnState === "completed" ? "本轮结束" : turnState === "failed" ? "执行失败" : turnState === "running" ? "运行中" : "未知");
+      }
       // Bodies arrive as typed, and a JSON-stringified task carries literal "\\n"
       // escapes; collapse those into spacing so the preview reads as one line.
       var body = String(m.body || "").replace(/\\n/g, " ").replace(/\s+/g, " ").slice(0, 200);

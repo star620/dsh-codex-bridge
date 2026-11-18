@@ -60,12 +60,20 @@ const claimed = await post('/deliver', { peer: 'dsh', seq: sent.message.seq, tar
 ok(claimed.state === 'claimed', 'claim accepted', JSON.stringify(claimed))
 const inbox = await tool('bridge_inbox')
 ok(/held:dsh->lane-x \(\d+s lease\)/.test(inbox), 'inbox shows the live claim as held', inbox)
+ok(inbox.includes('turn=-'), 'inbox distinguishes unknown turn evidence')
 const ack = await tool('bridge_ack', { up_to: sent.message.seq, target: 'lane-x' })
 ok(/in flight/.test(ack) && new RegExp('seqs ' + sent.message.seq).test(ack), 'ack is refused with the in-flight seqs', ack)
 const confirmed = await post('/confirm', { peer: 'dsh', seq: sent.message.seq })
 ok(confirmed.state === 'delivered', 'confirm marks it delivered')
 const ack2 = await tool('bridge_ack', { up_to: sent.message.seq, target: 'lane-x' })
 ok(/cursor for dsh lane lane-x is now/.test(ack2), 'ack goes through after the confirm', ack2)
+ok(ack2.includes('turn=-'), 'ack includes unknown turn evidence')
+const turnMsg = (await post('/send', { from: 'codex', to: 'dsh', body: 'turn ended', meta: { sessionId: 'turn-lane' } })).message
+const turnClaim = await post('/deliver', { peer: 'dsh', seq: turnMsg.seq, target: 'turn-lane', instance: 'mcp-turn' })
+await post('/confirm', { peer: 'dsh', seq: turnMsg.seq, instance: 'mcp-turn' })
+await post('/turn', { peer: 'dsh', seq: turnMsg.seq, instance: 'mcp-turn', attempt: turnClaim.attempts, state: 'completed' })
+ok((await tool('bridge_inbox', { target: 'turn-lane' })).includes('turn=completed(本轮结束)'), 'inbox describes completed as this turn ended')
+ok((await tool('bridge_ack', { up_to: turnMsg.seq, target: 'turn-lane' })).includes('turn=completed(本轮结束)'), 'ack includes the completed turn')
 
 mcp.kill(); bus.kill()
 try { fs.rmSync(DIR, { recursive: true, force: true }) } catch {}

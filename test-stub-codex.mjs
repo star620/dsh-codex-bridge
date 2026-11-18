@@ -59,6 +59,11 @@ if (rolloutDir && mode === 'queue') {
 }
 if (mode === 'exec') {
   console.log(JSON.stringify({ type: 'thread.started', thread_id: 'stub-thread-1' }))
+  console.log(JSON.stringify({ type: 'turn.started' }))
+  // Transport retry errors must not be mistaken for terminal failure.
+  console.log(JSON.stringify({ type: 'error', message: 'Reconnecting... 2/5' }))
   console.log(JSON.stringify({ type: 'item.completed', text: 'stub done' }))
+  if (process.env.STUB_TURN_MODE === 'exit3') process.exit(3)
+  if (process.env.STUB_TURN_MODE !== 'missing') console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }))
 }
 process.exit(0)

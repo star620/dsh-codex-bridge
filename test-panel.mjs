@@ -233,6 +233,10 @@ const snapshot = {
     { junk: true },
   ],
 }
+snapshot.recent[0].delivery.turn = { state: 'completed' }
+snapshot.recent.push({ seq: 5, from: 'dsh', to: 'codex', body: 'failed turn', delivery: { state: 'delivered', target: 'T', turn: { state: 'failed', exitCode: 3 } } })
+snapshot.recent.push({ seq: 4, from: 'dsh', to: 'codex', body: 'unknown turn', delivery: { state: 'delivered', target: 'T', turn: null } })
+snapshot.recent.push({ seq: 3, from: 'dsh', to: 'codex', body: 'running turn', delivery: { state: 'delivered', target: 'T', turn: { state: 'running' } } })
 const online = await renderPanel({ fetchImpl: async (url) => {
   if (String(url).includes('/status')) return { ok: true, json: async () => snapshot }
   return { ok: true, json: async () => ({ ok: true }) }
@@ -243,6 +247,10 @@ ok('renders the unread pill', online.text.includes('1 未读'))
 ok('renders a message body', online.text.includes('do the thing'))
 // A lease and a delivery are different promises; the panel must not print one word for both.
 ok('shows a delivery as 已投', online.text.includes('已投 thread-1'))
+ok('completed means this turn ended', online.text.includes('本轮结束') && !online.text.includes('已处理'))
+ok('failed turn is separate from delivery', online.text.includes('执行失败') && online.text.includes('failed turn'))
+ok('missing turn is unknown', online.text.includes('未知'))
+ok('running turn is visible', online.text.includes('运行中'))
 ok('shows a live claim as 在途 with its remaining lease', online.text.includes('在途 codex · 租约剩 42s'))
 ok('renders a codex thread', online.text.includes('fix the bus'))
 ok('renders the lane', online.text.includes('codex @ thread-1'))

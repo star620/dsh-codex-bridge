@@ -86,6 +86,13 @@ async function ensureBus() {
   }
 }
 
+const turnText = d => {
+  const t = d && d.turn
+  if (!t) return 'turn=-'
+  if (t.state === 'completed') return 'turn=completed(本轮结束)'
+  if (t.state === 'failed') return 'turn=failed(' + (Number.isInteger(t.exitCode) ? 'exit ' + t.exitCode : '执行失败') + ')'
+  return 'turn=running'
+}
 const fmt = (m) => {
   const route = m.target ? '  @' + m.target : ''
   const d = m.delivery
@@ -101,7 +108,7 @@ const fmt = (m) => {
   const tag = m.projectId || projectKeyOf(m)
   const project = tag ? '  #' + tag : ''
   return '[' + m.seq + '] ' + m.ts + '  ' + m.from + ' -> ' + m.to + route + project + '  (' + m.kind + ')' +
-    (m.replyTo ? '  re:' + m.replyTo : '') + state + '\n' + m.body
+    (m.replyTo ? '  re:' + m.replyTo : '') + state + '  ' + turnText(d) + '\n' + m.body
 }
 
 const tools = [
@@ -268,9 +275,10 @@ async function call(name, args) {
       ...(target ? { target } : {}), ...(args.all ? { all: true } : {}),
       ...(project ? { project } : {}),
     })
+    const last = await api('GET', '/delivery?seq=' + encodeURIComponent(args.up_to)).catch(() => ({}))
     return 'cursor for ' + PEER + (target ? ' lane ' + target : (project ? ' project ' + project : '')) +
       ' is now ' + r.cursor + ' [' + (r.scope || 'peer') + ' scope' +
-      (project && !target ? ', peer still at ' + (r.peerCursor ?? 0) : '') + ']'
+      (project && !target ? ', peer still at ' + (r.peerCursor ?? 0) : '') + '] ' + turnText(last.delivery)
   }
   if (name === 'bridge_peers') {
     const r = await api('GET', '/peers')
