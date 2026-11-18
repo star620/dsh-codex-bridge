@@ -555,6 +555,15 @@ const server = http.createServer(async (req, res) => {
         [p, Object.fromEntries(Object.entries(kinds).map(([k, v]) => [k, Array.isArray(v.items) ? v.items.length : 0]))]))
       return json(res, 200, { ok: true, port: PORT, dir: DIR, seq, registered, peers: [...new Set(messages.flatMap(m => [m.from, m.to]))].filter(p => p !== '*') })
     }
+    if (url.pathname === '/message' && req.method === 'GET') {
+      if (!corsOk) return json(res, 403, { ok: false, error: 'origin not allowed' })
+      const m = messages.find(m => m.seq === Number(url.searchParams.get('seq')))
+      if (!m) return json(res, 404, { ok: false, error: 'no such message' })
+      return json(res, 200, { ok: true, message: {
+        seq: m.seq, ts: m.ts, from: m.from, to: m.to, kind: m.kind,
+        body: m.body, meta: m.meta ?? null, replyTo: m.replyTo ?? null, delivery: deliveryView(m.seq),
+      } })
+    }
     if (url.pathname === '/status') {
       // A dashboard refresh is also a good moment to clear leases whose holder died: otherwise
       // the panel and the pusher keep seeing a claim that no longer protects anything.
@@ -899,6 +908,7 @@ const server = http.createServer(async (req, res) => {
       }
       const at = typeof b.at === 'string' && Number.isFinite(Date.parse(b.at)) ? b.at : new Date().toISOString()
       const turn = { state: b.state, instance: b.instance, attempt: b.attempt, at }
+      if (b.state !== 'running' && prev.turn && prev.turn.state === 'running') turn.startedAt = prev.turn.at
       if (Number.isInteger(b.exitCode)) turn.exitCode = b.exitCode
       if (b.usage && typeof b.usage === 'object' && !Array.isArray(b.usage)) {
         turn.usage = Object.fromEntries(Object.entries(b.usage).filter(([, v]) => Number.isFinite(v) && v >= 0))

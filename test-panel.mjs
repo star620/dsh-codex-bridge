@@ -150,13 +150,22 @@ function makeHooks() {
       if (!slots.has(i)) slots.set(i, { current: init })
       return slots.get(i)
     },
-    useCallback(fn) { index++; return fn },
-    useEffect(fn) { const i = index++; effects.push(fn) },
+    useCallback(fn, deps) {
+      const i = index++, old = slots.get(i)
+      if (old && deps && deps.every((v, n) => Object.is(v, old.deps[n]))) return old.fn
+      slots.set(i, { fn, deps }); return fn
+    },
+    useEffect(fn, deps) {
+      const i = index++, old = slots.get(i)
+      if (old && deps && deps.length === old.deps?.length && deps.every((v, n) => Object.is(v, old.deps[n]))) return
+      effects.push(() => { old?.cleanup?.(); slots.set(i, { deps, cleanup: fn() }) })
+    },
   }
   return {
     React,
     begin() { index = 0 },
     runEffects() { const list = effects; effects = []; for (const fn of list) fn() },
+    unmount() { for (const slot of slots.values()) slot?.cleanup?.(); effects = [] },
   }
 }
 
@@ -171,20 +180,22 @@ function flatten(node, out = []) {
   return out
 }
 
-async function renderPanel({ fetchImpl }) {
+async function renderPanel({ fetchImpl, now }) {
   const hooks = makeHooks()
   let loaded = null
   const requests = []
+  const timers = new Map(); let timerId = 0
+  const Clock = now === undefined ? Date : class extends Date { constructor(...args) { super(...(args.length ? args : [now])) } static now() { return now } }
   const sandbox = {
     window: { __ModuleLoader__: { load: (entry) => { loaded = entry } } },
     console: { warn: () => {}, log: () => {} },
     fetch: (url, init) => { requests.push({ url, init }); return fetchImpl(url, init) },
     setInterval: () => 0, clearInterval: () => {},
-    setTimeout: () => 0, clearTimeout: () => {},
+    setTimeout: (fn, ms) => { timers.set(++timerId, { fn, ms }); return timerId }, clearTimeout: id => timers.delete(id),
     AbortController: class { constructor() { this.signal = { aborted: false } } abort() { this.signal.aborted = true } },
     document: { hidden: true },
     URLSearchParams, encodeURIComponent,
-    JSON, Math, Date, String, Number, Object, Array, Error,
+    JSON, Math, Date: Clock, String, Number, Object, Array, Error,
   }
   sandbox.globalThis = sandbox
   vm.createContext(sandbox)
@@ -210,9 +221,18 @@ async function renderPanel({ fetchImpl }) {
   captured({ sessionId: 'session-abc' })
   hooks.runEffects()
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0))
-  hooks.begin()
-  const tree = captured({ sessionId: 'session-abc' })
-  return { text: flatten(tree).join(' '), requests }
+  const materialize = node => {
+    if (!node || typeof node !== 'object') return node
+    if (Array.isArray(node)) return node.map(materialize)
+    if (typeof node.type === 'function') return materialize(node.type(node.props))
+    return { ...node, children: node.children?.map(materialize) }
+  }
+  const render = () => { hooks.begin(); const tree = materialize(captured({ sessionId: 'session-abc' })); hooks.runEffects(); return tree }
+  return { get text() { return flatten(render()).join(' ') }, requests, render,
+    settle: async () => { render(); for (let i = 0; i < 5; i++) await new Promise(r => setTimeout(r, 0)); return render() },
+    unmount: () => hooks.unmount(),
+    timeOut: () => { for (const [id, timer] of [...timers]) { timers.delete(id); timer.fn() } },
+  }
 }
 
 const snapshot = {
@@ -269,6 +289,80 @@ ok('shows ok:false as an error, not as online', failed.text.includes('总线未�
 
 const offline = await renderPanel({ fetchImpl: async () => { throw new Error('Failed to fetch') } })
 ok('shows a transport failure', offline.text.includes('总线未响应') && offline.text.includes('Failed to fetch'))
+
+// Interact with the real list component; time is fixed for exact duration labels.
+const fixedNow = Date.UTC(2026, 10, 18, 8, 0, 0)
+const startTime = new Date(fixedNow - 192000).toISOString()
+const endTime = new Date(fixedNow).toISOString()
+const completeBody = 'first line\nsecond line\n' + 'x'.repeat(400) + '\nFULL TAIL'
+const rich = structuredClone(snapshot)
+rich.recent = [
+  { seq: 7, from: 'dsh', to: 'codex', body: completeBody.slice(0, 240), delivery: { state: 'delivered', target: 'T', turn: { state: 'completed', startedAt: startTime, at: endTime, exitCode: 0, usage: { input_tokens: 18015674, cached_input_tokens: 63700, output_tokens: 131, reasoning_output_tokens: 32 } } } },
+  { seq: 6, from: 'dsh', to: 'codex', body: 'second preview', delivery: { state: 'delivered', target: 'T', turn: { state: 'running', at: startTime } } },
+  { seq: 5, from: 'dsh', to: 'codex', body: 'failure preview', delivery: { state: 'delivered', target: 'T', turn: { state: 'failed', startedAt: startTime, at: endTime, exitCode: 1 } } },
+  { seq: 4, from: 'dsh', to: 'codex', body: 'timeout preview', delivery: { state: 'delivered', target: 'T', turn: { state: 'failed', startedAt: startTime, at: endTime, note: 'timeout', exitCode: 1 } } },
+  { seq: 3, from: 'dsh', to: 'codex', body: 'legacy preview', delivery: { state: 'delivered', target: 'T', turn: { state: 'completed', at: endTime, exitCode: 0, usage: { input_tokens: 999 } } } },
+]
+const nodes = (node, predicate, out = []) => { if (!node || typeof node !== 'object') return out; if (predicate(node)) out.push(node); for (const ch of node.children || []) nodes(ch, predicate, out); return out }
+const rows = tree => nodes(tree, n => n.props?.role === 'button')
+const row = (ui, seq) => rows(ui.render()).find(n => n.props['data-seq'] === seq)
+const click = (ui, seq) => nodes(row(ui, seq), n => typeof n.props?.onClick === 'function')[0].props.onClick()
+const key = (ui, seq, name) => row(ui, seq).props.onKeyDown({ key: name, preventDefault() {} })
+const response = body => ({ ok: true, json: async () => body })
+const ui = await renderPanel({ now: fixedNow, fetchImpl: async url => {
+  if (String(url).includes('/status')) return response(rich)
+  if (String(url).includes('/message')) {
+    const seq = Number(new URL(String(url)).searchParams.get('seq'))
+    if (seq === 5) return { ok: false, status: 500 }
+    return response({ ok: true, message: { seq, body: seq === 7 ? completeBody : 'second\nfull body' } })
+  }
+  return response({ ok: true })
+} })
+ok('terminal duration and usage are formatted', ui.text.includes('本轮结束 · 3m12s · exit 0 · in 18.0M · cached 63.7k · out 131 · reason 32'))
+ok('running duration includes seconds', ui.text.includes('运行中 · 3m12s'))
+ok('failed duration includes exit code', ui.text.includes('执行失败 · 3m12s · exit 1'))
+ok('timeout label includes duration without implying business success', ui.text.includes('执行失败 · 超时 · 3m12s') && !ui.text.includes('已处理'))
+ok('legacy completion has no invented duration or usage', !flatten(row(ui, 3)).join(' ').includes('exit 0') && !flatten(row(ui, 3)).join(' ').includes('999'))
+ok('collapsed preview is 200 characters and accessible', row(ui, 7).props.tabIndex === 0 && row(ui, 7).props['aria-expanded'] === false && nodes(row(ui, 7), n => n.props?.style?.whiteSpace === 'nowrap' && typeof n.children?.[0] === 'string' && n.children[0].length === 200).length === 1 && !ui.text.includes('FULL TAIL'))
+ok('full message is not loaded until expansion', !ui.requests.some(r => String(r.url).includes('/message')))
+click(ui, 7); await ui.settle()
+ok('first title click expands with aria-expanded', row(ui, 7).props['aria-expanded'] === true)
+ok('full body preserves newlines and tail beyond status preview', nodes(row(ui, 7), n => n.children?.includes(completeBody)).length === 1)
+ok('expanded body has bounded scrolling and pre-wrap', nodes(row(ui, 7), n => n.props?.style?.whiteSpace === 'pre-wrap' && n.props.style.maxHeight === 480 && n.props.style.overflowY === 'auto').length === 1)
+click(ui, 7); ui.render()
+ok('second title click collapses', row(ui, 7).props['aria-expanded'] === false)
+click(ui, 7); await ui.settle()
+ok('reopening uses the seq cache', ui.requests.filter(r => String(r.url).includes('/message?seq=7')).length === 1)
+key(ui, 7, 'Escape'); ui.render()
+ok('Escape collapses', row(ui, 7).props['aria-expanded'] === false)
+key(ui, 7, 'Enter'); await ui.settle()
+ok('Enter expands', row(ui, 7).props['aria-expanded'] === true)
+key(ui, 6, ' '); await ui.settle()
+ok('Space expands another row and collapses the previous row', rows(ui.render()).filter(n => n.props['aria-expanded']).length === 1 && row(ui, 6).props['aria-expanded'] === true)
+click(ui, 5); await ui.settle()
+ok('lazy load failure is confined to expanded row', flatten(row(ui, 5)).join(' ').includes('读取全文失败：HTTP 500') && !flatten(row(ui, 7)).join(' ').includes('读取全文失败'))
+ok('panel only performs read requests and never ack', ui.requests.every(r => !String(r.url).includes('/ack') && (!r.init?.method || r.init.method === 'GET')))
+ui.unmount()
+
+const missingUsage = structuredClone(rich)
+missingUsage.recent[0].delivery.turn.usage = { input_tokens: 999 }
+const compact = await renderPanel({ now: fixedNow, fetchImpl: async () => response(missingUsage) })
+ok('small usage is exact and missing usage fields are omitted', compact.text.includes('in 999') && !compact.text.includes('cached ') && !compact.text.includes('reason '))
+compact.unmount()
+
+let resolveLate, lateSignal
+const delayed = await renderPanel({ now: fixedNow, fetchImpl: (url, init) => {
+  if (String(url).includes('/message')) { lateSignal = init.signal; return new Promise(resolve => { resolveLate = resolve }) }
+  return Promise.resolve(response(String(url).includes('/status') ? rich : { ok: true }))
+} })
+click(delayed, 7); delayed.render(); click(delayed, 7); delayed.render()
+ok('collapse aborts the in-flight full message request', lateSignal.aborted)
+resolveLate(response({ ok: true, message: { seq: 7, body: 'LATE RESPONSE' } })); await delayed.settle()
+ok('late response after collapse is ignored', !delayed.text.includes('LATE RESPONSE'))
+click(delayed, 7); delayed.render(); delayed.timeOut(); await delayed.settle()
+ok('four second timeout aborts and displays row error', lateSignal.aborted && delayed.text.includes('读取全文超时'))
+key(delayed, 7, 'Escape'); delayed.render(); click(delayed, 7); delayed.render(); delayed.unmount()
+ok('unmount aborts full message request', lateSignal.aborted)
 
 console.log('')
 console.log(pass + ' passed, ' + fail + ' failed')

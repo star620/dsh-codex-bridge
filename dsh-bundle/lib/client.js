@@ -116,6 +116,35 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function duration(from, to) {
+      var start = Date.parse(from), end = typeof to === "number" ? to : Date.parse(to);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return "";
+      var seconds = Math.max(0, Math.floor((end - start) / 1000));
+      return Math.floor(seconds / 60) + "m" + (seconds % 60) + "s";
+    }
+    function tokens(n) {
+      if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+      if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+      return String(n);
+    }
+    function turnLabel(turn) {
+      if (!turn) return "未知";
+      if (turn.state === "running") return "运行中" + (duration(turn.at, Date.now()) ? " · " + duration(turn.at, Date.now()) : "");
+      var parts = [turn.state === "completed" ? "本轮结束" : turn.state === "failed" ? "执行失败" : "未知"];
+      var elapsed = duration(turn.startedAt, turn.at);
+      if (turn.state === "completed" && !elapsed) return parts[0];
+      if (turn.note === "timeout") parts.push("超时");
+      if (elapsed) parts.push(elapsed);
+      if (turn.note !== "timeout" && Number.isInteger(turn.exitCode)) parts.push("exit " + turn.exitCode);
+      if (turn.state === "completed") {
+        var usage = turn.usage || {};
+        [["input_tokens", "in"], ["cached_input_tokens", "cached"], ["output_tokens", "out"], ["reasoning_output_tokens", "reason"]].forEach(function (pair) {
+          var n = usage[pair[0]];
+          if (typeof n === "number" && Number.isFinite(n) && n >= 0) parts.push(pair[1] + " " + tokens(n));
+        });
+      }
+      return parts.join(" · ");
+    }
     function MessageRow(props) {
       var m = props.message;
       var color = KIND_COLOR[m.kind] || KIND_COLOR.note;
@@ -131,18 +160,25 @@ window.__ModuleLoader__.load({
       if (d && d.state === "claimed") meta.push("在途 " + (d.peer || "?") + " · 租约剩 " + (d.expiresIn || 0) + "s");
       else if ((d && d.target) || m.deliveredBy) {
         meta.push("已投 " + ((d && d.target) || m.deliveredBy));
-        var turnState = d && d.turn && d.turn.state;
-        var turnAt = d && d.turn ? Date.parse(d.turn.at) : NaN;
-        var turnMinutes = Number.isFinite(turnAt) ? Math.max(0, Math.floor((Date.now() - turnAt) / 60000)) : 0;
-        meta.push(turnState === "completed" ? "本轮结束" : turnState === "failed" ? "执行失败" : turnState === "running" ? "运行中 · " + turnMinutes + "m" : "未知");
+        meta.push(turnLabel(d && d.turn));
       }
       // Bodies arrive as typed, and a JSON-stringified task carries literal "\\n"
       // escapes; collapse those into spacing so the preview reads as one line.
       var body = String(m.body || "").replace(/\\n/g, " ").replace(/\s+/g, " ").slice(0, 200);
+      var expanded = !!props.expanded;
+      var detail = props.detail || {};
+      if (expanded) body = detail.error || (typeof detail.body === "string" ? detail.body : "正在读取全文…");
       return h("div", {
+        role: "button", tabIndex: 0, "aria-expanded": expanded, "data-seq": m.seq,
+        onClick: props.onToggle,
+        onKeyDown: function (e) {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); props.onToggle(); }
+          else if (e.key === "Escape") { e.preventDefault(); props.onCollapse(); }
+        },
         style: {
           display: "flex",
           gap: 8,
+          cursor: "pointer",
           padding: "7px 0",
           borderBottom: "1px solid var(--dsw-alias-border-l3)",
           alignItems: "flex-start",
@@ -155,8 +191,12 @@ window.__ModuleLoader__.load({
           style: { fontSize: 11, color: color, width: 48, flex: "0 0 auto", paddingTop: 1 },
         }, m.kind || "note"),
         h("div", { style: { minWidth: 0, flex: "1 1 auto" } },
-          h("div", { style: { fontSize: 11, color: "var(--dsw-alias-label-tertiary)", marginBottom: 2 } }, meta.join("  ")),
-          h("div", { style: { fontSize: 12.5, color: "var(--dsw-alias-label-primary)", wordBreak: "break-word" } }, body)
+          h("div", { style: { display: "flex", gap: 8, fontSize: 11, color: "var(--dsw-alias-label-tertiary)", marginBottom: 2 } },
+            h("span", { style: { flex: 1 } }, meta.join("  ")),
+            h("span", { style: { fontSize: 12, color: "var(--dsw-alias-label-tertiary)" } }, expanded ? "收起" : "展开")),
+          h("div", { role: expanded && detail.error ? "alert" : undefined, style: expanded
+            ? { fontSize: 12.5, color: "var(--dsw-alias-label-primary)", whiteSpace: "pre-wrap", wordBreak: "break-word", overflowY: "auto", maxHeight: 480 }
+            : { fontSize: 12.5, color: "var(--dsw-alias-label-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, body)
         )
       );
     }
@@ -242,6 +282,29 @@ window.__ModuleLoader__.load({
       var autoState = React.useState(true);
       var auto = autoState[0];
       var setAuto = autoState[1];
+      var expandedState = React.useState(null);
+      var expandedSeq = expandedState[0], setExpandedSeq = expandedState[1];
+      var detailState = React.useState({});
+      var details = detailState[0], setDetails = detailState[1];
+      React.useEffect(function () {
+        if (expandedSeq === null || (details[expandedSeq] && typeof details[expandedSeq].body === "string")) return;
+        var active = true, timedOut = false;
+        var controller = new AbortController();
+        var put = function (entry) { setDetails(function (prev) { var next = Object.assign({}, prev); next[expandedSeq] = entry; return next; }); };
+        var timer = setTimeout(function () {
+          if (!active) return;
+          timedOut = true; controller.abort(); put({ error: "读取全文超时" });
+        }, 4000);
+        fetch(BUS + "/message?seq=" + encodeURIComponent(expandedSeq), { signal: controller.signal })
+          .then(function (res) { if (!res.ok) throw new Error("HTTP " + res.status); return res.json(); })
+          .then(function (raw) {
+            if (!active || timedOut) return;
+            if (!raw || raw.ok !== true || !raw.message || Number(raw.message.seq) !== expandedSeq || typeof raw.message.body !== "string") throw new Error("全文响应无效");
+            clearTimeout(timer); put({ body: raw.message.body });
+          })
+          .catch(function (err) { if (!active || timedOut) return; clearTimeout(timer); put({ error: "读取全文失败：" + String(err.message || err) }); });
+        return function () { active = false; clearTimeout(timer); controller.abort(); };
+      }, [expandedSeq]);
 
       var ctrlRef = React.useRef(null);
       var reqRef = React.useRef(0);
@@ -418,7 +481,9 @@ window.__ModuleLoader__.load({
           recent.length === 0
             ? h(Empty, { text: "还没有消息。DSH 侧可以调 bridge_send，Codex 侧调 bridge_inbox。" })
             : h("div", { style: { marginTop: 6 } }, recent.map(function (m) {
-                return h(MessageRow, { key: m.seq, message: m });
+                return h(MessageRow, { key: m.seq, message: m, expanded: expandedSeq === m.seq, detail: details[m.seq],
+                  onToggle: function () { setExpandedSeq(function (prev) { return prev === m.seq ? null : m.seq; }); },
+                  onCollapse: function () { setExpandedSeq(null); } });
               }))
         ),
 

@@ -67,10 +67,27 @@ try {
   check((await request('/turn', { ...payload, attempt: first.attempts })).status === 409, 'old attempt cannot overwrite this attempt')
   check((await request('/turn', { ...payload, state: 'done' })).status === 400, 'invalid state is rejected')
   check((await request('/turn', payload)).delivery.turn.state === 'running', 'running evidence can be recorded')
+  check(!('startedAt' in (await delivery(seq)).turn), 'running write does not add terminal startedAt')
+  const startedAt = (await delivery(seq)).turn.at
   check((await request('/turn', { ...payload, state: 'completed' })).delivery.turn.state === 'completed', 'running can become terminal')
+  check((await delivery(seq)).turn.startedAt === startedAt, 'completed inherits the observed running timestamp')
   await request('/confirm', { peer: 'codex', seq, instance })
   check((await delivery(seq)).turn.state === 'completed', 'idempotent confirm preserves turn')
   await request('/ack', { peer: 'codex', upTo: seq, all: true })
+
+  const legacySeq = await send()
+  const legacyClaim = await request('/deliver', { peer: 'codex', seq: legacySeq, target: 'T', instance })
+  await request('/confirm', { peer: 'codex', seq: legacySeq, instance })
+  const legacy = await request('/turn', { peer: 'codex', seq: legacySeq, instance, attempt: legacyClaim.attempts, state: 'completed' })
+  check(!('startedAt' in legacy.delivery.turn), 'terminal record without running evidence does not fabricate startedAt')
+  await request('/ack', { peer: 'codex', upTo: legacySeq, all: true })
+  const failedSeq = await send()
+  const failedClaim = await request('/deliver', { peer: 'codex', seq: failedSeq, target: 'T', instance })
+  await request('/confirm', { peer: 'codex', seq: failedSeq, instance })
+  const started = await request('/turn', { peer: 'codex', seq: failedSeq, instance, attempt: failedClaim.attempts, state: 'running' })
+  const failed = await request('/turn', { peer: 'codex', seq: failedSeq, instance, attempt: failedClaim.attempts, state: 'failed' })
+  check(failed.delivery.turn.startedAt === started.delivery.turn.at, 'failed also inherits running timestamp')
+  await request('/ack', { peer: 'codex', upTo: failedSeq, all: true })
 
   // Start evidence is visible while the child is still running, on all exec routes.
   for (const extra of [[], ['--wait'], ['--new'], ['--new', '--wait']]) {

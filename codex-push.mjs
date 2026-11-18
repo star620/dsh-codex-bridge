@@ -44,6 +44,9 @@ const RESUME = !flag('no-resume')
 // `codex exec` in the target cwd. Codex derives a new thread id on its own and we report it.
 const FORCE_NEW = flag('new')
 const SANDBOX = value('sandbox', 'workspace-write')
+// 'exec resume' has no -s flag: it silently inherits the thread's original sandbox, so a thread
+// opened read-only (a review) refuses to write even when this run wants workspace-write.
+const SANDBOX_ARGS = ['-c', 'sandbox_mode="' + SANDBOX + '"']
 const EXEC_CWD = value('cwd', process.cwd())
 // Delivery scope for messages that carry no meta.cwd; empty means "refuse rather than guess".
 const SCOPE_CWD = value('scope', '')
@@ -507,7 +510,7 @@ function startResumeAsync(message, thread, text, attempt) {
     '--thread', thread, '--prompt', promptFile,
     '--cwd', (typeof message?.meta?.cwd === 'string' && message.meta.cwd) || EXEC_CWD,
     '--timeout', String(EXEC_TIMEOUT), '--port', String(PORT), '--peer', PEER, '--instance', INSTANCE,
-    '--outbox', OUTBOX, '--attempt', String(attempt),
+    '--outbox', OUTBOX, '--attempt', String(attempt), '--sandbox', SANDBOX,
     ...(CODEX_JS ? ['--codex-js', CODEX_JS] : []),
   ], { detached: true, stdio: ['ignore', logFd, logFd], windowsHide: true })
   child.unref()
@@ -522,7 +525,7 @@ function startResumeAsync(message, thread, text, attempt) {
 async function resumeWorkerMain() {
   const seq = Number(value('seq', 0)), thread = value('thread', '')
   const prompt = fs.readFileSync(value('prompt', ''), 'utf8')
-  const argv = ['exec', 'resume', thread, '--skip-git-repo-check', '--json', '-o', path.join(OUTBOX, 'seq-' + seq + '.last.md'), '-']
+  const argv = ['exec', 'resume', thread, '--skip-git-repo-check', ...SANDBOX_ARGS, '--json', '-o', path.join(OUTBOX, 'seq-' + seq + '.last.md'), '-']
   const run = await runExec(seq, thread, argv, prompt, value('cwd', process.cwd()), Number(value('attempt', 0)))
   try { fs.unlinkSync(todoPath(seq)) } catch {}
   fs.writeFileSync(donePath(seq), JSON.stringify({ seq, thread, ok: run.ok, via: 'exec' }), 'utf8')
@@ -561,7 +564,7 @@ async function deliver(message) {
       return { ok: false, reason: took.reason }
     }
     if (!ASYNC) {
-      const argv = ['exec', 'resume', thread, '--skip-git-repo-check', '--json', '-']
+      const argv = ['exec', 'resume', thread, '--skip-git-repo-check', ...SANDBOX_ARGS, '--json', '-']
       const cwd = (typeof message?.meta?.cwd === 'string' && message.meta.cwd) || EXEC_CWD
       return { ...await runExec(message.seq, thread, argv, text, cwd, took.attempt), command: line }
     }
