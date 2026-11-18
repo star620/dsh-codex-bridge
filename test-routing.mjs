@@ -26,8 +26,8 @@ const get = async p => (await fetch(BASE + p)).json()
 // DSH side publishes two live sessions, the way wake-bundle does.
 const published = await post('/registry', {
   peer: 'dsh', kind: 'session', items: [
-    { id: 'sess-a', label: '神秘项目 主会话', cwd: 'C:\\Users\\星梦\\Desktop\\11_神秘项目', status: 'idle' },
-    { id: 'sess-b', label: 'UTSL 平台', cwd: 'C:\\Users\\星梦\\Desktop\\01_UTSL平台', status: 'running' },
+    { id: 'sess-a', label: 'demo session', cwd: 'C:\\work\\demo', status: 'idle' },
+    { id: 'sess-b', label: 'other session', cwd: 'C:\\work\\other', status: 'running' },
   ],
 })
 assert(published.ok && published.count === 2, 'registry accepts published sessions')
@@ -53,7 +53,7 @@ assert(tools.includes('bridge_sessions') && tools.includes('bridge_threads'), 'a
 
 const sessions = await call('bridge_sessions')
 assert(sessions.includes('sess-a') && sessions.includes('sess-b'), 'bridge_sessions lists published sessions')
-const filtered = await call('bridge_sessions', { cwd: 'C:\\Users\\星梦\\Desktop\\01_UTSL平台' })
+const filtered = await call('bridge_sessions', { cwd: 'C:\\work\\other' })
 assert(filtered.includes('sess-b') && !filtered.includes('sess-a'), 'bridge_sessions honours the cwd filter')
 
 const threads = await call('bridge_threads', { limit: 3 })

@@ -29,7 +29,7 @@ async function health() {
 await health()
 
 const calls = []
-const PROJ = 'C:\\Users\\星梦\\Desktop\\11_神秘项目'
+const PROJ = 'C:\\work\\demo'
 const agent = {
   status: 'idle',
   session: { id: 'sess-1', header: { cwd: PROJ } },
@@ -47,7 +47,7 @@ const other = (id, cwd) => ({
   followup(message) { otherCalls.push([id, message]) },
   inbox: { inject(message) { otherCalls.push([id, message]) } },
 })
-const bystanders = [other('sess-2', 'C:\\Users\\星梦\\Desktop\\01_UTSL平台'), other('sess-3', 'C:\\Users\\星梦\\Desktop\\12_备忘记')]
+const bystanders = [other('sess-2', 'C:\\work\\other'), other('sess-3', 'C:\\work\\third')]
 // A delegated child session: depth 1, so the default config must leave it alone.
 const childCalls = []
 const child = {
