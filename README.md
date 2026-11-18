@@ -194,7 +194,7 @@ node codex-push.mjs --send --once --gui --cwd "C:\work\my-project"
 
 ### 点名投递
 
-```powershell
+```text
 # DSH 侧：看有哪些 Codex 线程可以点名
 bridge_threads cwd="C:\work\my-project"
 
