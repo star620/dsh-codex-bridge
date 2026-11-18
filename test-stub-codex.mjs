@@ -58,12 +58,29 @@ if (rolloutDir && mode === 'queue') {
   }
 }
 if (mode === 'exec') {
+  // All exec callers send the prompt via stdin; consume it before producing events.
+  let input = ''
+  for await (const chunk of process.stdin) input += chunk.toString('utf8')
+  if (process.env.STUB_TURN_MODE === 'split' && !input.includes('[bridge seq ')) process.exit(7)
+  if (process.env.STUB_TURN_MODE === 'no-evidence') process.exit(3)
   console.log(JSON.stringify({ type: 'thread.started', thread_id: 'stub-thread-1' }))
-  console.log(JSON.stringify({ type: 'turn.started' }))
+  const started = JSON.stringify({ type: 'turn.started' }) + '\n'
+  if (process.env.STUB_TURN_MODE === 'split') {
+    process.stdout.write(started.slice(0, 8))
+    await new Promise(r => setTimeout(r, 100))
+    process.stdout.write(started.slice(8))
+  } else console.log(started.trim())
+  console.log(started.trim()) // repeated start evidence must not create another running write
+  if (['delayed', 'split'].includes(process.env.STUB_TURN_MODE)) await new Promise(r => setTimeout(r, 1500))
+  if (process.env.STUB_TURN_MODE === 'timeout') await new Promise(r => setTimeout(r, 10000))
   // Transport retry errors must not be mistaken for terminal failure.
   console.log(JSON.stringify({ type: 'error', message: 'Reconnecting... 2/5' }))
   console.log(JSON.stringify({ type: 'item.completed', text: 'stub done' }))
   if (process.env.STUB_TURN_MODE === 'exit3') process.exit(3)
-  if (process.env.STUB_TURN_MODE !== 'missing') console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }))
+  if (process.env.STUB_TURN_MODE !== 'missing') {
+    const ended = JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } })
+    if (process.env.STUB_TURN_MODE === 'no-newline') process.stdout.write(ended)
+    else console.log(ended)
+  }
 }
 process.exit(0)

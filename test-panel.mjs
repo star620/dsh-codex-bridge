@@ -236,7 +236,7 @@ const snapshot = {
 snapshot.recent[0].delivery.turn = { state: 'completed' }
 snapshot.recent.push({ seq: 5, from: 'dsh', to: 'codex', body: 'failed turn', delivery: { state: 'delivered', target: 'T', turn: { state: 'failed', exitCode: 3 } } })
 snapshot.recent.push({ seq: 4, from: 'dsh', to: 'codex', body: 'unknown turn', delivery: { state: 'delivered', target: 'T', turn: null } })
-snapshot.recent.push({ seq: 3, from: 'dsh', to: 'codex', body: 'running turn', delivery: { state: 'delivered', target: 'T', turn: { state: 'running' } } })
+snapshot.recent.push({ seq: 3, from: 'dsh', to: 'codex', body: 'running turn', delivery: { state: 'delivered', target: 'T', turn: { state: 'running', at: new Date(Date.now() - 125000).toISOString() } } })
 const online = await renderPanel({ fetchImpl: async (url) => {
   if (String(url).includes('/status')) return { ok: true, json: async () => snapshot }
   return { ok: true, json: async () => ({ ok: true }) }
@@ -251,6 +251,7 @@ ok('completed means this turn ended', online.text.includes('本轮结束') && !o
 ok('failed turn is separate from delivery', online.text.includes('执行失败') && online.text.includes('failed turn'))
 ok('missing turn is unknown', online.text.includes('未知'))
 ok('running turn is visible', online.text.includes('运行中'))
+ok('running turn shows elapsed minutes', online.text.includes('运行中 · 2m'))
 ok('shows a live claim as 在途 with its remaining lease', online.text.includes('在途 codex · 租约剩 42s'))
 ok('renders a codex thread', online.text.includes('fix the bus'))
 ok('renders the lane', online.text.includes('codex @ thread-1'))

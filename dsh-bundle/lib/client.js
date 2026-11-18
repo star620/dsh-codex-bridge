@@ -132,7 +132,9 @@ window.__ModuleLoader__.load({
       else if ((d && d.target) || m.deliveredBy) {
         meta.push("已投 " + ((d && d.target) || m.deliveredBy));
         var turnState = d && d.turn && d.turn.state;
-        meta.push(turnState === "completed" ? "本轮结束" : turnState === "failed" ? "执行失败" : turnState === "running" ? "运行中" : "未知");
+        var turnAt = d && d.turn ? Date.parse(d.turn.at) : NaN;
+        var turnMinutes = Number.isFinite(turnAt) ? Math.max(0, Math.floor((Date.now() - turnAt) / 60000)) : 0;
+        meta.push(turnState === "completed" ? "本轮结束" : turnState === "failed" ? "执行失败" : turnState === "running" ? "运行中 · " + turnMinutes + "m" : "未知");
       }
       // Bodies arrive as typed, and a JSON-stringified task carries literal "\\n"
       // escapes; collapse those into spacing so the preview reads as one line.

@@ -71,6 +71,8 @@ ok(ack2.includes('turn=-'), 'ack includes unknown turn evidence')
 const turnMsg = (await post('/send', { from: 'codex', to: 'dsh', body: 'turn ended', meta: { sessionId: 'turn-lane' } })).message
 const turnClaim = await post('/deliver', { peer: 'dsh', seq: turnMsg.seq, target: 'turn-lane', instance: 'mcp-turn' })
 await post('/confirm', { peer: 'dsh', seq: turnMsg.seq, instance: 'mcp-turn' })
+await post('/turn', { peer: 'dsh', seq: turnMsg.seq, instance: 'mcp-turn', attempt: turnClaim.attempts, state: 'running', at: new Date().toISOString() })
+ok(/turn=running\(since \d{2}:\d{2}\)/.test(await tool('bridge_inbox', { target: 'turn-lane' })), 'inbox shows the observed running time')
 await post('/turn', { peer: 'dsh', seq: turnMsg.seq, instance: 'mcp-turn', attempt: turnClaim.attempts, state: 'completed' })
 ok((await tool('bridge_inbox', { target: 'turn-lane' })).includes('turn=completed(本轮结束)'), 'inbox describes completed as this turn ended')
 ok((await tool('bridge_ack', { up_to: turnMsg.seq, target: 'turn-lane' })).includes('turn=completed(本轮结束)'), 'ack includes the completed turn')

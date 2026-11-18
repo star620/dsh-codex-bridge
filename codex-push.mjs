@@ -47,7 +47,8 @@ const SANDBOX = value('sandbox', 'workspace-write')
 const EXEC_CWD = value('cwd', process.cwd())
 // Delivery scope for messages that carry no meta.cwd; empty means "refuse rather than guess".
 const SCOPE_CWD = value('scope', '')
-const EXEC_TIMEOUT = Math.max(60000, Number(value('timeout', 900000)))
+// 1s, not 1ms: tests pass small values, but a typo must not kill a turn instantly.
+const EXEC_TIMEOUT = Math.max(1000, Number(value('timeout', 900000)))
 // --gui prefers a thread the Codex desktop app created (session_meta.source=vscode),
 // because exec threads never show up in its "recent" list.
 const GUI = flag('gui')
@@ -304,9 +305,9 @@ async function claim(seqNo, target) {
  * becomes the real thread id once Codex reports it). /deliver would refuse the retarget —
  * that refusal is what keeps two consumers off one message.
  */
-async function confirm(seqNo, target) {
+async function confirm(seqNo, target, signal) {
   try {
-    const r = await api('POST', '/confirm', { peer: PEER, seq: seqNo, target, instance: INSTANCE })
+    const r = await api('POST', '/confirm', { peer: PEER, seq: seqNo, target, instance: INSTANCE }, signal)
     if (r && r.ok === false) console.error('[codex-push] confirm failed for seq ' + seqNo + ': ' + (r.error || 'unknown'))
     return r
   } catch (err) {
@@ -319,57 +320,97 @@ async function release(seqNo) {
   try { await api('POST', '/release', { peer: PEER, seq: seqNo, instance: INSTANCE }) } catch {}
 }
 
-/** Parse only this worker's stdout; retry errors are not terminal evidence. */
-async function settleExec(seqNo, thread, run, attempt) {
-  const events = []
-  for (const line of (run.stdout || '').split(/\r?\n/)) {
-    try { events.push(JSON.parse(line)) } catch {}
-  }
-  const completed = events.find(e => e && e.type === 'turn.completed')
-  const started = events.some(e => e && e.type === 'turn.started')
-  const received = run.status === 0 || started || !!completed
-  if (!received || !thread) { await release(seqNo); return false }
-  const receipt = await confirm(seqNo, thread)
-  if (!receipt || !receipt.ok) return false
-  const state = run.status === 0 && completed ? 'completed' : 'failed'
+/** Optional turn metadata never changes delivery or ack eligibility. */
+async function writeTurn(seq, attempt, state, at, details = {}) {
   try {
-    const r = await api('POST', '/turn', {
-      peer: PEER, seq: seqNo, instance: INSTANCE, attempt, state,
-      at: new Date().toISOString(), exitCode: run.status,
-      ...(completed && completed.usage ? { usage: completed.usage } : {}),
-      ...(state === 'failed' ? { note: run.error ? String(run.error.message) :
-        (run.status === 0 ? 'process exited without turn.completed' : 'process exited nonzero') } : {}),
-    }, AbortSignal.timeout(5000))
-    if (!r || !r.ok) console.error('[codex-push] turn write failed for seq ' + seqNo + ': ' + (r && r.error || 'no response'))
-  } catch (err) {
-    console.error('[codex-push] turn write failed for seq ' + seqNo + ': ' + String(err.message || err))
-  }
-  return true // turn persistence never changes a confirmed delivery
+    const r = await api('POST', '/turn', { peer: PEER, seq, instance: INSTANCE, attempt, state, at, ...details }, AbortSignal.timeout(5000))
+    if (!r || !r.ok) console.error('[codex-push] turn write failed for seq ' + seq + ': ' + (r && r.error || 'no response'))
+  } catch (err) { console.error('[codex-push] turn write failed for seq ' + seq + ': ' + String(err.message || err)) }
 }
 
-/** Deliver into a brand new Codex conversation. Blocking: it runs the turn to completion. */
-async function startConversation(message, attempt) {
-  const explicit = message?.meta?.thread
-  const cwd = (typeof message?.meta?.cwd === 'string' && message.meta.cwd) || EXEC_CWD
-  const argv = ['exec', '--skip-git-repo-check', '-s', SANDBOX, '-C', cwd, '--json', promptFor(message)]
-  const line = '"' + codexExe() + '" ' + argv.map(a => '"' + a.replace(/"/g, '\\"') + '"').join(' ')
-  if (!SEND) return { ok: true, thread: '(new)', command: line, queued: false }
-  if (explicit) return { ok: false, reason: 'meta.thread and meta.new conflict' }
+/** One child and one stdout stream identify this attempt; JSON records may span chunks. */
+async function runExec(seq, initialThread, argv, prompt, cwd, attempt) {
   const call = codexCommand(argv)
-  const run = spawnSync(call.cmd, call.argv, {
-    encoding: 'utf8', windowsHide: true, timeout: EXEC_TIMEOUT, stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  let thread = ''
-  for (const row of (run.stdout || '').split(/\r?\n/)) {
-    if (!row.trim().startsWith('{')) continue
-    try {
-      const event = JSON.parse(row)
-      const id = event.thread_id || event.threadId || (event.thread && event.thread.id)
-      if (id) { thread = String(id); if (event.type === 'thread.started') break }
-    } catch {}
+  let thread = initialThread, completed = null, started = false, startedAt = null
+  let confirmed = false, runningQueued = false, pending = Buffer.alloc(0), stderr = Buffer.alloc(0)
+  let writes = Promise.resolve(), timedOut = false, processError = null
+  const ensureConfirmed = async () => {
+    if (!confirmed && thread) {
+      const r = await confirm(seq, thread, AbortSignal.timeout(5000))
+      confirmed = !!(r && r.ok)
+    }
+    return confirmed
   }
-  const ok = await settleExec(message.seq, thread, run, attempt)
-  return { ok, thread: thread || '(unknown)', queued: ok, command: line, status: run.status, stderr: (run.stderr || '').slice(0, 400) }
+  const maybeRunning = () => {
+    if (!started || !thread || runningQueued) return
+    runningQueued = true
+    writes = writes.then(async () => {
+      if (await ensureConfirmed()) await writeTurn(seq, attempt, 'running', startedAt)
+    })
+  }
+  const record = line => {
+    let e; try { e = JSON.parse(line.toString('utf8')) } catch { return }
+    if (!e || typeof e !== 'object') return
+    if (e.type === 'thread.started' && typeof e.thread_id === 'string' && !thread) thread = e.thread_id
+    if (e.type === 'turn.started' && !started) { started = true; startedAt = new Date().toISOString() }
+    if (e.type === 'turn.completed') completed = e
+    maybeRunning()
+  }
+  const child = spawn(call.cmd, call.argv, { cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+  const result = await new Promise(resolve => {
+    let killTimer
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGTERM')
+      killTimer = setTimeout(() => child.kill('SIGKILL'), 5000)
+    }, EXEC_TIMEOUT)
+    const onOut = data => {
+      pending = Buffer.concat([pending, data])
+      let nl
+      while ((nl = pending.indexOf(10)) >= 0) { record(pending.subarray(0, nl)); pending = pending.subarray(nl + 1) }
+    }
+    const onErr = data => { stderr = Buffer.concat([stderr, data]).subarray(-1604) }
+    const onError = err => { processError = err }
+    const onInputError = () => {} // a child may close stdin before the prompt is fully written
+    child.stdout.on('data', onOut)
+    child.stderr.on('data', onErr)
+    child.on('error', onError)
+    child.stdin.on('error', onInputError)
+    child.once('close', (status, signal) => {
+      clearTimeout(timer); clearTimeout(killTimer)
+      if (pending.length) record(pending)
+      pending = Buffer.alloc(0)
+      child.stdout.off('data', onOut); child.stderr.off('data', onErr)
+      child.off('error', onError); child.stdin.off('error', onInputError)
+      resolve({ status, signal })
+    })
+    child.stdin.end(prompt)
+  })
+  await writes
+  const received = started || !!completed || result.status === 0
+  if (!received || !thread) {
+    await release(seq)
+    return { ...result, ok: false, queued: false, thread: thread || '(unknown)', stderr: stderr.toString('utf8').slice(-400) }
+  }
+  if (!(await ensureConfirmed())) return { ...result, ok: false, queued: false, thread, stderr: 'delivery confirmation failed' }
+  const state = !timedOut && result.status === 0 && completed ? 'completed' : 'failed'
+  await writeTurn(seq, attempt, state, new Date().toISOString(), {
+    ...(Number.isInteger(result.status) ? { exitCode: result.status } : {}),
+    ...(completed && completed.usage ? { usage: completed.usage } : {}),
+    ...(state === 'failed' ? { note: timedOut ? 'timeout' : processError ? String(processError.message) :
+      result.status === 0 ? 'process exited without turn.completed' : 'process exited nonzero' } : {}),
+  })
+  return { ...result, ok: true, queued: true, thread, stderr: stderr.toString('utf8').slice(-400) }
+}
+
+/** --wait still awaits the same streaming runner used by detached workers. */
+async function startConversation(message, attempt) {
+  const cwd = (typeof message?.meta?.cwd === 'string' && message.meta.cwd) || EXEC_CWD
+  const argv = ['exec', '--skip-git-repo-check', '-s', SANDBOX, '-C', cwd, '--json', '-']
+  const command = 'codex exec --json -'
+  if (!SEND) return { ok: true, thread: '(new)', command, queued: false }
+  if (message?.meta?.thread) return { ok: false, reason: 'meta.thread and meta.new conflict' }
+  return { ...await runExec(message.seq, '', argv, promptFor(message), cwd, attempt), command }
 }
 
 /** Marker files let the parent tell "a fresh conversation is still running" from "done". */
@@ -438,36 +479,15 @@ function startConversationAsync(message, attempt) {
   }
 }
 
-/** Worker entry: run the fresh conversation, then report the thread id (or release the claim). */
+/** Detached fresh conversation: use the same stdin and streaming evidence path. */
 async function workerMain() {
-  const seqNo = Number(value('seq', 0))
+  const seq = Number(value('seq', 0)), cwd = value('cwd', process.cwd())
   const prompt = fs.readFileSync(value('prompt', ''), 'utf8')
-  const argv = ['exec', '--skip-git-repo-check', '-s', value('sandbox', SANDBOX),
-    '-C', value('cwd', process.cwd()), '--json', prompt]
-  const call = codexCommand(argv)
-  const run = spawnSync(call.cmd, call.argv, {
-    encoding: 'utf8', windowsHide: true, timeout: Number(value('timeout', EXEC_TIMEOUT)),
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  let thread = ''
-  for (const row of (run.stdout || '').split(/\r?\n/)) {
-    if (!row.trim().startsWith('{')) continue
-    try {
-      const event = JSON.parse(row)
-      const id = event.thread_id || event.threadId || (event.thread && event.thread.id)
-      if (id) { thread = String(id); if (event.type === 'thread.started') break }
-    } catch {}
-  }
-  const delivered = await settleExec(seqNo, thread, run, Number(value('attempt', 0)))
-  if (delivered) {
-    console.log('[worker] seq ' + seqNo + ' -> ' + thread)
-  } else {
-    console.log('[worker] seq ' + seqNo + ' failed (status ' + run.status + '): ' + String(run.stderr || '').slice(0, 400))
-  }
-  try { fs.unlinkSync(todoPath(seqNo)) } catch {}
-  fs.writeFileSync(donePath(seqNo), JSON.stringify({ seq: seqNo, thread, ok: run.status === 0 }), 'utf8')
+  const argv = ['exec', '--skip-git-repo-check', '-s', SANDBOX, '-C', cwd, '--json', '-']
+  const run = await runExec(seq, '', argv, prompt, cwd, Number(value('attempt', 0)))
+  try { fs.unlinkSync(todoPath(seq)) } catch {}
+  fs.writeFileSync(donePath(seq), JSON.stringify({ seq, thread: run.thread, ok: run.ok }), 'utf8')
 }
-
 
 /**
  * Deliver into an existing thread by RUNNING it, not by queueing into a store nobody reads.
@@ -498,26 +518,14 @@ function startResumeAsync(message, thread, text, attempt) {
   }
 }
 
-/** Worker entry for --via exec: resume the thread once, then confirm or release its claim. */
+/** Existing-thread worker, with the same lifecycle as --new and --wait. */
 async function resumeWorkerMain() {
-  const seqNo = Number(value('seq', 0))
-  const thread = value('thread', '')
+  const seq = Number(value('seq', 0)), thread = value('thread', '')
   const prompt = fs.readFileSync(value('prompt', ''), 'utf8')
-  const outFile = path.join(OUTBOX, 'seq-' + seqNo + '.last.md')
-  const argv = ['exec', 'resume', thread, '--skip-git-repo-check', '--json', '-o', outFile, '-']
-  const call = codexCommand(argv)
-  const run = spawnSync(call.cmd, call.argv, {
-    encoding: 'utf8', windowsHide: true, timeout: Number(value('timeout', EXEC_TIMEOUT)),
-    cwd: value('cwd', process.cwd()), input: prompt, stdio: ['pipe', 'pipe', 'pipe'],
-  })
-  const ok = await settleExec(seqNo, thread, run, Number(value('attempt', 0)))
-  if (ok) {
-    console.log('[worker] seq ' + seqNo + ' -> ' + thread + ' (resumed)')
-  } else {
-    console.log('[worker] seq ' + seqNo + ' resume failed (status ' + run.status + '): ' + String(run.stderr || '').slice(0, 400))
-  }
-  try { fs.unlinkSync(todoPath(seqNo)) } catch {}
-  fs.writeFileSync(donePath(seqNo), JSON.stringify({ seq: seqNo, thread, ok, via: 'exec' }), 'utf8')
+  const argv = ['exec', 'resume', thread, '--skip-git-repo-check', '--json', '-o', path.join(OUTBOX, 'seq-' + seq + '.last.md'), '-']
+  const run = await runExec(seq, thread, argv, prompt, value('cwd', process.cwd()), Number(value('attempt', 0)))
+  try { fs.unlinkSync(todoPath(seq)) } catch {}
+  fs.writeFileSync(donePath(seq), JSON.stringify({ seq, thread, ok: run.ok, via: 'exec' }), 'utf8')
 }
 
 async function deliver(message) {
@@ -551,6 +559,11 @@ async function deliver(message) {
     if (!took.ok) {
       if (took.already) return { ok: true, skipped: 'already delivered elsewhere', thread }
       return { ok: false, reason: took.reason }
+    }
+    if (!ASYNC) {
+      const argv = ['exec', 'resume', thread, '--skip-git-repo-check', '--json', '-']
+      const cwd = (typeof message?.meta?.cwd === 'string' && message.meta.cwd) || EXEC_CWD
+      return { ...await runExec(message.seq, thread, argv, text, cwd, took.attempt), command: line }
     }
     return startResumeAsync(message, thread, text, took.attempt)
   }

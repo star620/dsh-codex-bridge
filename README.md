@@ -192,7 +192,7 @@ node codex-push.mjs --send --once --gui --cwd "C:\work\my-project"
 
 **`/ack` 的语义是「已投递」，不是「已完成」。** 消息进了对方线程就推进游标；对方之后执行失败也不会自动回到收件箱。要确认完成，靠对方回一条带 `reply_to` 的 `result`。
 
-交付记录另含独立的 `turn`：缺失或 `null` 显示「未知」，`running` 显示「运行中」，`completed` 只显示「本轮结束」，`failed` 显示「执行失败」。本轮结束不代表业务成功。exec worker 保留 `spawnSync`，进程返回后根据自己的 stdout 与退出码补记终态；重试用的 `error` 事件不算终态。已接收输入的执行失败不撤销 delivered，也不自动重投。queue 未送达时不写 turn。
+交付记录另含独立的 `turn`：缺失或 `null` 显示「未知」，`running` 显示「运行中 · Xm」，`completed` 只显示「本轮结束」，`failed` 显示「执行失败」。本轮结束不代表业务成功。exec 现在使用流式 `spawn`，收到真实 `turn.started` 后立即 confirm 并写 running；进程退出后根据自己的 stdout 与退出码记录终态。重试用的 `error` 事件不算终态。已接收输入的执行失败不撤销 delivered，也不自动重投。queue 未送达时不写 turn。
 
 `POST /turn` 必须携带当前投递的 `peer`、`seq`、`instance`、`attempt` 和 `state`（running/completed/failed）；只接受已 delivered 且身份、尝试编号一致的记录。未知不写成 failed，终态不可倒退或被另一终态覆盖。`delivery-attempts.json` 保留跨 release 的编号，防止旧 worker 重用尝试号。终态写入失败只记录日志，投递确认与 ack 不受影响；`/delivery`、`/inbox`、`/status.recent` 均返回 turn。
 

@@ -25,9 +25,9 @@ const waitFor = async fn => {
   throw new Error('timed out waiting for worker')
 }
 const send = async () => (await request('/send', { from: 'dsh', to: 'codex', body: 'turn test', meta: { thread: 'test-thread', cwd: DIR } })).message.seq
-const push = (mode, port = PORT) => new Promise((resolve, reject) => {
+const push = (mode, port = PORT, extra = []) => new Promise((resolve, reject) => {
   const child = spawn(process.execPath, [path.join(ROOT, 'codex-push.mjs'), '--send', '--once', '--yes', '--all-projects',
-    '--port', String(port), '--via', 'exec', '--cwd', DIR, '--codex-js', path.join(ROOT, 'test-stub-codex.mjs')],
+    '--port', String(port), '--via', 'exec', '--cwd', DIR, '--codex-js', path.join(ROOT, 'test-stub-codex.mjs'), ...extra],
   { env: { ...env, STUB_TURN_MODE: mode }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
   let out = ''
   child.stdout.on('data', b => { out += b })
@@ -42,7 +42,7 @@ try {
     const seq = await send()
     check((await delivery(seq)) === null, 'no execution evidence starts unknown: ' + mode)
     check((await push(mode)).code === 0, 'push exits cleanly: ' + mode)
-    const d = await waitFor(async () => { const x = await delivery(seq); return x && x.turn ? x : null })
+    const d = await waitFor(async () => { const x = await delivery(seq); return x && x.turn && x.turn.state !== 'running' ? x : null })
     check(d.state === 'delivered', 'execution outcome retains delivered: ' + mode)
     check(d.turn.state === state && d.turn.exitCode === exitCode, 'terminal evidence: ' + mode)
     check(d.turn.instance === d.instance && d.turn.attempt === d.attempts, 'worker identity is bound: ' + mode)
@@ -72,9 +72,44 @@ try {
   check((await delivery(seq)).turn.state === 'completed', 'idempotent confirm preserves turn')
   await request('/ack', { peer: 'codex', upTo: seq, all: true })
 
+  // Start evidence is visible while the child is still running, on all exec routes.
+  for (const extra of [[], ['--wait'], ['--new'], ['--new', '--wait']]) {
+    const streamSeq = extra.includes('--new')
+      ? (await request('/send', { from: 'dsh', to: 'codex', body: 'fresh streaming', meta: { new: true, cwd: DIR } })).message.seq
+      : await send()
+    const pendingPush = push('delayed', PORT, extra)
+    const live = await waitFor(async () => { const x = await delivery(streamSeq); return x?.turn?.state === 'running' ? x : null })
+    check(live.state === 'delivered', 'delivered while child still running: ' + extra.join(' '))
+    check(live.turn.state === 'running' && Number.isFinite(Date.parse(live.turn.at)), 'running timestamp before completion: ' + extra.join(' '))
+    await pendingPush
+    await waitFor(async () => (await delivery(streamSeq))?.turn?.state === 'completed')
+    check((await delivery(streamSeq)).turn.state === 'completed', 'streaming route records final state: ' + extra.join(' '))
+    await request('/ack', { peer: 'codex', upTo: streamSeq, all: true })
+  }
+  for (const mode of ['split', 'no-newline', 'timeout']) {
+    const streamSeq = await send()
+    await push(mode, PORT, mode === 'timeout' ? ['--timeout', '3000'] : [])
+    if (mode === 'split') {
+      const live = await waitFor(async () => { const x = await delivery(streamSeq); return x?.turn?.state === 'running' ? x : null })
+      check(live.state === 'delivered', 'split start line is recognised before completion, with prompt on stdin')
+    }
+    const d = await waitFor(async () => { const x = await delivery(streamSeq); return x?.turn && x.turn.state !== 'running' ? x : null })
+    check(d.state === 'delivered', 'stream evidence retains delivery: ' + mode)
+    check(d.turn.state === (mode === 'timeout' ? 'failed' : 'completed'), 'stream terminal state: ' + mode)
+    if (mode === 'timeout') check(d.turn.note === 'timeout', 'timeout records exact note without requeue')
+    await request('/ack', { peer: 'codex', upTo: streamSeq, all: true })
+  }
+  const noEvidence = await send()
+  await push('no-evidence')
+  await waitFor(async () => fs.existsSync(path.join(os.tmpdir(), 'codex-bridge-outbox', 'p' + PORT, 'codex', 'all', 'seq-' + noEvidence + '.done')))
+  check((await delivery(noEvidence)) === null, 'nonzero exit without evidence releases claim and writes no turn')
+  check((await request('/inbox?peer=codex')).messages.some(m => m.seq === noEvidence), 'no-evidence failure stays available')
+  await request('/ack', { peer: 'codex', upTo: noEvidence, all: true })
+
   // A failed /turn write must never undo confirmation or block the next cleanup ack.
+  let turnWrites = 0
   proxy = http.createServer(async (req, res) => {
-    if (req.url === '/turn') { res.writeHead(503, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"test unavailable"}'); return }
+    if (req.url === '/turn') { turnWrites++; res.writeHead(503, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"test unavailable"}'); return }
     try {
       const chunks = []; for await (const chunk of req) chunks.push(chunk)
       const r = await fetch(BASE + req.url, { method: req.method, ...(req.method === 'POST' ? { headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks) } : {}) })
@@ -88,6 +123,7 @@ try {
   // Wait for the detached worker to finish the failed metadata write.
   await waitFor(async () => fs.existsSync(path.join(os.tmpdir(), 'codex-bridge-outbox', 'p' + proxy.address().port, 'codex', 'all', 'seq-' + unavailableSeq + '.done')))
   check((await delivery(unavailableSeq)).turn === null, 'unavailable turn endpoint leaves unknown, not failed')
+  check(turnWrites === 2, 'duplicate turn.started produces exactly one running write and one terminal write')
   await push('completed', proxy.address().port)
   check(!(await request('/inbox?peer=codex')).messages.some(m => m.seq === unavailableSeq), 'metadata failure does not block delivered cleanup ack')
   console.log('TURN TEST PASSED: ' + assertions + ' assertions')

@@ -91,7 +91,9 @@ const turnText = d => {
   if (!t) return 'turn=-'
   if (t.state === 'completed') return 'turn=completed(本轮结束)'
   if (t.state === 'failed') return 'turn=failed(' + (Number.isInteger(t.exitCode) ? 'exit ' + t.exitCode : '执行失败') + ')'
-  return 'turn=running'
+  const at = new Date(t.at)
+  const since = Number.isFinite(at.getTime()) ? String(at.getHours()).padStart(2, '0') + ':' + String(at.getMinutes()).padStart(2, '0') : '--:--'
+  return 'turn=running(since ' + since + ')'
 }
 const fmt = (m) => {
   const route = m.target ? '  @' + m.target : ''
