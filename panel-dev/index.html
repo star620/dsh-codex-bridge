@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Codex 桥 · 面板预览</title>
+  <style>
+    /* Stand-in for the DSH theme the panel inherits inside the app. Keep the var names
+       identical — the point of this page is to render the real bundle, not a mock. */
+    :root {
+      --dsw-alias-bg-base: #17181b;
+      --dsw-alias-label-primary: #e8e9ec;
+      --dsw-alias-label-secondary: #b3b6bd;
+      --dsw-alias-label-tertiary: #888c94;
+      --dsw-alias-label-caption: #6b6f77;
+      --dsw-alias-border-l3: #2c2e33;
+      --dsw-alias-state-business-primary: #6aa9ff;
+      --dsw-alias-state-success-primary: #4cc38a;
+      --dsw-alias-state-warn-primary: #e0b152;
+      --dsw-alias-state-error-primary: #e0697a;
+      color-scheme: dark;
+    }
+    html, body { margin: 0; height: 100%; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); }
+    body { font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; }
+    #root { height: 100%; }
+    #dev-note { position: fixed; right: 10px; bottom: 8px; font-size: 11px; color: var(--dsw-alias-label-caption); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <div id="dev-note">dev harness · lib/client.js 原样加载</div>
+
+  <script>
+    // Minimal stand-in for the DSH web shell: the loader only records the factory,
+    // exactly like the real one (side effects run at materialization, not at load).
+    // ?bus=http://127.0.0.1:8799 renders the offline state without touching the real bus.
+    // Same-origin by default: serve.mjs proxies /status and /panel/ping to BRIDGE_URL,
+    // so the preview cannot silently read (and ping) the production bus by accident.
+    // ?bus=http://127.0.0.1:8799 overrides that for the offline state.
+    var params = new URLSearchParams(location.search);
+    window.__CODEX_BRIDGE_BUS__ = params.get("bus") || location.origin;
+    window.__DEV_SESSION_ID__ = params.get("session") || "dev-panel";
+    // ?badge=N previews the sidebar unread badge without waiting for a real message.
+    window.__DEV_BADGE_COUNTS__ = params.has("badge")
+      ? (function () { var counts = {}; counts[window.__DEV_SESSION_ID__] = Number(params.get("badge")) || 0; return counts; })()
+      : {};
+    window.__ModuleLoader__ = {
+      load: function (entry) { window.__DEV_FACTORY__ = entry; },
+    };
+    window.require = function (name) {
+      if (name === "react") return window.React;
+      if (name === "react/jsx-runtime") {
+        return {
+          jsx: window.React.createElement,
+          jsxs: window.React.createElement,
+          Fragment: window.React.Fragment,
+        };
+      }
+      throw new Error("dev harness cannot require " + name);
+    };
+  </script>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="lib/client.js"></script>
+
+  <script>
+    (function () {
+      var registered = [];
+      var fakeCtx = {
+        slots: {
+          inject: function (name, factory) { window.__DEV_SLOT__ = name; factory(); },
+          register: function (spec, Component) {
+            registered.push({ spec: spec, Component: Component });
+            window.__DEV_REGISTERED__ = { spec: spec };
+            return function () {};
+          },
+        },
+        locale: { getLocale: function () { return { active: "zh-CN" }; }, register: function () {} },
+        effect: function (fn) { return fn(); },
+        get: function () { return undefined; },
+      };
+      try {
+        var entry = window.__DEV_FACTORY__;
+        if (!entry) throw new Error("client.js did not call __ModuleLoader__.load");
+        var mods = entry.factory(window.require);
+        window.__DEV_ID__ = entry.id;
+        window.__DEV_INJECT__ = mods.inject;
+        mods.apply(fakeCtx);
+        if (!registered.length) throw new Error("apply() registered no conversation view");
+        var view = registered.filter(function (r) { return r.spec.name === "conversation.view"; })[0];
+        if (!view) throw new Error("apply() registered no conversation view");
+        var badge = registered.filter(function (r) { return r.spec.name === "sidebar.session.row.trailing"; })[0];
+        window.__DEV_SLOTS__ = registered.map(function (r) { return { name: r.spec.name, id: r.spec.id, order: r.spec.order }; });
+        var props = view.spec.inject(window.__DEV_SESSION_ID__);
+        window.__DEV_LABEL__ = view.spec.label();
+        ReactDOM.createRoot(document.getElementById("root")).render(
+          React.createElement(React.Fragment, null,
+            React.createElement(view.Component, props),
+            badge
+              ? React.createElement("div", {
+                  style: {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "10px 16px 14px",
+                    borderTop: "1px solid var(--dsw-alias-border-l3)",
+                    fontSize: 12,
+                    color: "var(--dsw-alias-label-secondary)",
+                  },
+                }, "侧栏行徽标预览：", React.createElement(badge.Component, {
+                  sessionId: window.__DEV_SESSION_ID__,
+                  bridgeUnread: window.__DEV_BADGE_COUNTS__,
+                }))
+              : null
+          )
+        );
+        window.__DEV_READY__ = true;
+      } catch (err) {
+        window.__DEV_ERROR__ = String((err && err.stack) || err);
+        document.getElementById("root").textContent = "HARNESS ERROR: " + window.__DEV_ERROR__;
+      }
+    })();
+  </script>
+</body>
+</html>

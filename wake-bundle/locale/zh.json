@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Codex 桥接唤醒",
+    "description": "Codex 往本地桥接总线发消息时，自动叫醒空闲的 DSH 会话。"
+  }
+}

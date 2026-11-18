@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Codex 桥接",
+    "description": "与本地 Codex 互相收发任务和结果。"
+  }
+}

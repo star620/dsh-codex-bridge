@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Codex bridge wake",
+    "description": "Wakes an idle DSH agent when Codex posts a message to the local bridge bus."
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@local/codex-bridge-wake",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Wake a DSH agent when Codex posts to the local bridge bus",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
